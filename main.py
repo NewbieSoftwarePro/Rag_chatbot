@@ -34,20 +34,54 @@ llm = ChatGroq(
 )
 
 
+def get_all_sources():
+    """Get the unique list of paper filenames stored in Chroma."""
+    all_metadata = vectorstore._collection.get(include=["metadatas"])["metadatas"]
+    sources = {m.get("source") for m in all_metadata if m.get("source")}
+    return sorted(sources)
+
+
+ALL_SOURCES = get_all_sources()
+
+
 class QueryRequest(BaseModel):
     question: str
 
 
 @app.post("/query")
 def query(request: QueryRequest):
-    results = vectorstore.similarity_search(request.question, k=3)
-    context = "\n\n".join(doc.page_content for doc in results)
+    # Retrieve a couple of the most relevant chunks from EACH paper separately,
+    # instead of one global top-k search. A global search naturally clusters
+    # around whichever 1-2 papers phrase things closest to the question,
+    # so broad questions ("what datasets are used across these papers")
+    # would silently drop papers that never made the top-k. Searching
+    # per-source guarantees every paper gets a chance to contribute.
+    all_results = []
+    for source in ALL_SOURCES:
+        matches = vectorstore.similarity_search(
+            request.question,
+            k=2,
+            filter={"source": source},
+        )
+        all_results.extend(matches)
 
-    prompt = f"""Answer the question using ONLY the context below.
-If the answer isn't in the context, say you don't know.
+    context = "\n\n".join(
+        f"[Source: {doc.metadata.get('source', 'unknown')}]\n{doc.page_content}"
+        for doc in all_results
+    )
+
+    prompt = f"""You are answering questions about a collection of research papers.
+The context below is grouped by source paper. Some passages may not be
+relevant to the question — ignore those. If the question asks broadly about
+"all papers" or "each paper," cover every paper that has relevant information,
+not just the closest match.
+
+If none of the passages answer the question, say you don't have enough
+information — do not guess or use knowledge outside the passages.
 
 Context:
 {context}
+
 Question: {request.question}
 """
     response = llm.invoke([HumanMessage(content=prompt)])
